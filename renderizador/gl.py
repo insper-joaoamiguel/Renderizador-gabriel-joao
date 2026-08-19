@@ -51,9 +51,20 @@ class GL:
         # Exemplo:
         pos_x = GL.width//2
         pos_y = GL.height//2
-        gpu.GPU.draw_pixel([pos_x, pos_y], gpu.GPU.RGB8, [255, 0, 0])  # altera pixel (u, v, tipo, r, g, b)
+        # gpu.GPU.draw_pixel([pos_x, pos_y], gpu.GPU.RGB8, [255, 0, 0])  # altera pixel (u, v, tipo, r, g, b)
         # cuidado com as cores, o X3D especifica de (0,1) e o Framebuffer de (0,255)
-        
+
+        cores = []
+        for c in colors["emissiveColor"]:
+            cores.append(int(c*255))
+
+        for i in range(0, len(point) // 2):
+            i = i * 2
+            px = int(point[i])
+            py = int(point[i+1])
+            gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, cores)            
+            
+
     @staticmethod
     def polyline2D(lineSegments, colors):
         """Função usada para renderizar Polyline2D."""
@@ -111,7 +122,52 @@ class GL:
         print("TriangleSet2D : colors = {0}".format(colors)) # imprime no terminal as cores
 
         # Exemplo:
-        gpu.GPU.draw_pixel([6, 8], gpu.GPU.RGB8, [255, 255, 0])  # altera pixel (u, v, tipo, r, g, b)
+        # gpu.GPU.draw_pixel([6, 8], gpu.GPU.RGB8, [255, 255, 0])  # altera pixel (u, v, tipo, r, g, b)
+
+        cores = []
+        for c in colors["emissiveColor"]:
+            cores.append(int(c*255))
+
+        def L(ax, ay, bx, by, x, y):
+            return ((by - ay) * x
+                    - (bx - ax) * y
+                    + ay * (bx - ax)
+                    - ax * (by - ay))
+        
+        for i in range(0, len(vertices), 6):
+
+            x0 = vertices[i]
+            y0 = vertices[i + 1]
+
+            x1 = vertices[i + 2]
+            y1 = vertices[i + 3]
+
+            x2 = vertices[i + 4]
+            y2 = vertices[i + 5]
+
+            xmin = max(0, int(min(x0, x1, x2)))
+            xmax = min(GL.width - 1, int(max(x0, x1, x2)))
+
+            ymin = max(0, int(min(y0, y1, y2)))
+            ymax = min(GL.height - 1, int(max(y0, y1, y2)))
+
+
+            for px in range(xmin, xmax + 1):
+                for py in range(ymin, ymax + 1):
+
+                    sx = px + 0.5
+                    sy = py + 0.5
+
+                    l0 = L(x0, y0, x1, y1, sx, sy)
+                    l1 = L(x1, y1, x2, y2, sx, sy)
+                    l2 = L(x2, y2, x0, y0, sx, sy)
+
+                    if ((l0 >= 0 and l1 >= 0 and l2 >= 0) or
+                        (l0 <= 0 and l1 <= 0 and l2 <= 0)):
+
+                        gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, cores)
+
+        
 
 
     @staticmethod
