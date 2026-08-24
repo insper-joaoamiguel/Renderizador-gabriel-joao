@@ -92,34 +92,36 @@ class GL:
         for c in colors['emissiveColor']:
             cores.append(int(c*255))
 
-        x0, y0, x1, y1 = lineSegments
+        for i in range(0, len(lineSegments) - 2, 2):
+            x0, y0 = lineSegments[i], lineSegments[i + 1]
+            x1, y1 = lineSegments[i + 2], lineSegments[i + 3]
 
-        dx = x1 - x0
-        dy = y1 - y0
+            dx = x1 - x0
+            dy = y1 - y0
 
-        if abs(dx) >= abs(dy):
-            if x0 > x1:
-                x0, y0, x1, y1 = x1, y1, x0, y0
+            if abs(dx) >= abs(dy):
+                if x0 > x1:
+                    x0, y0, x1, y1 = x1, y1, x0, y0
 
-            s = (y1 - y0) / (x1 - x0)
-            for u in range(int(x0), int(x1) + 1):
-                v = y0 + s * (u - x0)
-                try:
-                    gpu.GPU.draw_pixel([u, int(v)], gpu.GPU.RGB8, cores)
-                except Exception:
-                    pass
+                s = (y1 - y0) / (x1 - x0)
+                for u in range(int(x0), int(x1) + 1):
+                    v = y0 + s * (u - x0)
+                    try:
+                        gpu.GPU.draw_pixel([u, int(v)], gpu.GPU.RGB8, cores)
+                    except Exception:
+                        pass
 
-        else:
-            if y0 > y1:
-                x0, y0, x1, y1 = x1, y1, x0, y0
+            else:
+                if y0 > y1:
+                    x0, y0, x1, y1 = x1, y1, x0, y0
 
-            s = (x1 - x0) / (y1 - y0)
-            for u in range(int(y0), int(y1) + 1):
-                v = x0 + s * (u - y0)
-                try:
-                    gpu.GPU.draw_pixel([int(v), u], gpu.GPU.RGB8, cores)
-                except Exception:
-                    pass
+                s = (x1 - x0) / (y1 - y0)
+                for u in range(int(y0), int(y1) + 1):
+                    v = x0 + s * (u - y0)
+                    try:
+                        gpu.GPU.draw_pixel([int(v), u], gpu.GPU.RGB8, cores)
+                    except Exception:
+                        pass
                 
 
 
