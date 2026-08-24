@@ -104,7 +104,10 @@ class GL:
             s = (y1 - y0) / (x1 - x0)
             for u in range(int(x0), int(x1) + 1):
                 v = y0 + s * (u - x0)
-                gpu.GPU.draw_pixel([u, int(v)], gpu.GPU.RGB8, cores)
+                try:
+                    gpu.GPU.draw_pixel([u, int(v)], gpu.GPU.RGB8, cores)
+                except Exception:
+                    pass
 
         else:
             if y0 > y1:
@@ -113,7 +116,10 @@ class GL:
             s = (x1 - x0) / (y1 - y0)
             for u in range(int(y0), int(y1) + 1):
                 v = x0 + s * (u - y0)
-                gpu.GPU.draw_pixel([int(v), u], gpu.GPU.RGB8, cores)
+                try:
+                    gpu.GPU.draw_pixel([int(v), u], gpu.GPU.RGB8, cores)
+                except Exception:
+                    pass
                 
 
 
