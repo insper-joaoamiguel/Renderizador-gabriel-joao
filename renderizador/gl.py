@@ -44,10 +44,6 @@ class GL:
         # O parâmetro colors é um dicionário com os tipos cores possíveis, para o Polypoint2D
         # você pode assumir inicialmente o desenho dos pontos com a cor emissiva (emissiveColor).
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Polypoint2D : pontos = {0}".format(point)) # imprime no terminal pontos
-        print("Polypoint2D : colors = {0}".format(colors)) # imprime no terminal as cores
-
         # Exemplo:
         pos_x = GL.width//2
         pos_y = GL.height//2
@@ -224,12 +220,54 @@ class GL:
         # (emissiveColor), conforme implementar novos materias você deverá suportar outros
         # tipos de cores.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TriangleSet : pontos = {0}".format(point)) # imprime no terminal pontos
-        print("TriangleSet : colors = {0}".format(colors)) # imprime no terminal as cores
-
         # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        # gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+
+        cores = [int(c * 255) for c in colors["emissiveColor"]]
+
+        def L(ax, ay, bx, by, x, y):
+            return ((by - ay) * x - (bx - ax) * y
+                    + ay * (bx - ax) - ax * (by - ay))
+
+        # Recupera o estado salvo (com fallback pra identidade se ainda não foi setado)
+        view_matrix = getattr(GL, "view_matrix", np.identity(4))
+        perspective_matrix = getattr(GL, "perspective_matrix", np.identity(4))
+        transform_stack = getattr(GL, "transform_stack", [np.identity(4)])
+
+        model = getattr(GL, "transform_matrix", np.identity(4))
+        mvp = perspective_matrix @ view_matrix @ model
+
+        screen_points = []
+        for i in range(0, len(point), 3):
+            p = np.array([point[i], point[i + 1], point[i + 2], 1.0])
+            p_clip = mvp @ p
+            p_ndc = p_clip[:3] / p_clip[3] if p_clip[3] != 0 else p_clip[:3]
+
+            sx = (p_ndc[0] + 1) * 0.5 * GL.width
+            sy = (1 - p_ndc[1]) * 0.5 * GL.height
+            screen_points += [sx, sy]
+
+        for i in range(0, len(screen_points), 6):
+            x0, y0 = screen_points[i], screen_points[i + 1]
+            x1, y1 = screen_points[i + 2], screen_points[i + 3]
+            x2, y2 = screen_points[i + 4], screen_points[i + 5]
+
+            xmin = max(0, int(min(x0, x1, x2)))
+            xmax = min(GL.width - 1, int(max(x0, x1, x2)))
+            ymin = max(0, int(min(y0, y1, y2)))
+            ymax = min(GL.height - 1, int(max(y0, y1, y2)))
+
+            for px in range(xmin, xmax + 1):
+                for py in range(ymin, ymax + 1):
+                    sx, sy = px + 0.5, py + 0.5
+                    l0 = L(x0, y0, x1, y1, sx, sy)
+                    l1 = L(x1, y1, x2, y2, sx, sy)
+                    l2 = L(x2, y2, x0, y0, sx, sy)
+                    if ((l0 >= 0 and l1 >= 0 and l2 >= 0) or
+                        (l0 <= 0 and l1 <= 0 and l2 <= 0)):
+                        gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, cores)
+
+
 
     @staticmethod
     def viewpoint(position, orientation, fieldOfView):
@@ -238,11 +276,51 @@ class GL:
         # câmera virtual. Use esses dados para poder calcular e criar a matriz de projeção
         # perspectiva para poder aplicar nos pontos dos objetos geométricos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Viewpoint : ", end='')
-        print("position = {0} ".format(position), end='')
-        print("orientation = {0} ".format(orientation), end='')
-        print("fieldOfView = {0} ".format(fieldOfView))
+        def rotation_matrix(x, y, z, angle):
+            axis = np.array([x, y, z], dtype=float)
+            norm = np.linalg.norm(axis)
+            if norm > 1e-8:
+                axis = axis / norm
+            x, y, z = axis
+            c, s, t = math.cos(angle), math.sin(angle), 1 - math.cos(angle)
+            R = np.identity(4)
+            R[0, 0] = t*x*x + c
+            R[0, 1] = t*x*y - s*z
+            R[0, 2] = t*x*z + s*y
+            R[1, 0] = t*x*y + s*z
+            R[1, 1] = t*y*y + c
+            R[1, 2] = t*y*z - s*x
+            R[2, 0] = t*x*z - s*y
+            R[2, 1] = t*y*z + s*x
+            R[2, 2] = t*z*z + c
+            return R
+
+        T = np.identity(4)
+        T[0, 3], T[1, 3], T[2, 3] = position[0], position[1], position[2]
+
+        R = rotation_matrix(orientation[0], orientation[1], orientation[2], orientation[3])
+
+        camera_matrix = T @ R
+
+        # Guarda o estado como atributo dinâmico da classe GL
+        setattr(GL, "view_matrix", np.linalg.inv(camera_matrix))
+
+        aspect = GL.width / GL.height
+        fovy = fieldOfView
+        if aspect > 1:
+            fovy = 2 * math.atan(math.tan(fieldOfView / 2) / aspect)
+
+        f = 1.0 / math.tan(fovy / 2)
+        near, far = GL.near, GL.far
+
+        P = np.zeros((4, 4))
+        P[0, 0] = f / aspect
+        P[1, 1] = f
+        P[2, 2] = (far + near) / (near - far)
+        P[2, 3] = (2 * far * near) / (near - far)
+        P[3, 2] = -1
+
+        setattr(GL, "perspective_matrix", P)
 
     @staticmethod
     def transform_in(translation, scale, rotation):
@@ -258,15 +336,40 @@ class GL:
         # Quando começar a usar Transforms dentre de outros Transforms, mais a frente no curso
         # Você precisará usar alguma estrutura de dados pilha para organizar as matrizes.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Transform : ", end='')
+        def rotation_matrix(x, y, z, angle):
+            axis = np.array([x, y, z], dtype=float)
+            norm = np.linalg.norm(axis)
+            if norm > 1e-8:
+                axis = axis / norm
+            x, y, z = axis
+            c, s, t = math.cos(angle), math.sin(angle), 1 - math.cos(angle)
+            R = np.identity(4)
+            R[0, 0] = t*x*x + c
+            R[0, 1] = t*x*y - s*z
+            R[0, 2] = t*x*z + s*y
+            R[1, 0] = t*x*y + s*z
+            R[1, 1] = t*y*y + c
+            R[1, 2] = t*y*z - s*x
+            R[2, 0] = t*x*z - s*y
+            R[2, 1] = t*y*z + s*x
+            R[2, 2] = t*z*z + c
+            return R
+
+        T = np.identity(4)
+        S = np.identity(4)
+        R = np.identity(4)
+
         if translation:
-            print("translation = {0} ".format(translation), end='') # imprime no terminal
+            T[0, 3], T[1, 3], T[2, 3] = translation[0], translation[1], translation[2]
         if scale:
-            print("scale = {0} ".format(scale), end='') # imprime no terminal
+            S[0, 0], S[1, 1], S[2, 2] = scale[0], scale[1], scale[2]
         if rotation:
-            print("rotation = {0} ".format(rotation), end='') # imprime no terminal
-        print("")
+            R = rotation_matrix(rotation[0], rotation[1], rotation[2], rotation[3])
+
+        model = T @ R @ S
+
+        # SEM pilha: sobrescreve a matriz atual
+        setattr(GL, "transform_matrix", model)
 
     @staticmethod
     def transform_out():
