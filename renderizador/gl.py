@@ -306,11 +306,7 @@ class GL:
         setattr(GL, "view_matrix", np.linalg.inv(camera_matrix))
 
         aspect = GL.width / GL.height
-        fovy = fieldOfView
-        if aspect > 1:
-            fovy = 2 * math.atan(math.tan(fieldOfView / 2) / aspect)
-
-        f = 1.0 / math.tan(fovy / 2)
+        f = 1.0 / math.tan(fieldOfView / 2)
         near, far = GL.near, GL.far
 
         P = np.zeros((4, 4))
@@ -359,16 +355,23 @@ class GL:
         S = np.identity(4)
         R = np.identity(4)
 
-        if translation:
+        if translation is not None:
             T[0, 3], T[1, 3], T[2, 3] = translation[0], translation[1], translation[2]
-        if scale:
+        if scale is not None:
             S[0, 0], S[1, 1], S[2, 2] = scale[0], scale[1], scale[2]
-        if rotation:
+        if rotation is not None:
             R = rotation_matrix(rotation[0], rotation[1], rotation[2], rotation[3])
 
-        model = T @ R @ S
+        local = T @ R @ S
 
-        # SEM pilha: sobrescreve a matriz atual
+        current = np.asarray(getattr(GL, "transform_matrix", np.identity(4)), dtype=float)
+        stack = getattr(GL, "transform_stack", None)
+        if stack is None:
+            stack = []
+        stack.append(current.copy())
+        setattr(GL, "transform_stack", stack)
+
+        model = current @ local
         setattr(GL, "transform_matrix", model)
 
     @staticmethod
@@ -379,8 +382,12 @@ class GL:
         # deverá recuperar a matriz de transformação dos modelos do mundo da estrutura de
         # pilha implementada.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Saindo de Transform")
+        stack = getattr(GL, "transform_stack", [])
+        if stack:
+            setattr(GL, "transform_matrix", stack.pop())
+            setattr(GL, "transform_stack", stack)
+        else:
+            setattr(GL, "transform_matrix", np.identity(4))
 
     @staticmethod
     def triangleStripSet(point, stripCount, colors):
@@ -397,15 +404,23 @@ class GL:
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TriangleStripSet : pontos = {0} ".format(point), end='')
-        for i, strip in enumerate(stripCount):
-            print("strip[{0}] = {1} ".format(i, strip), end='')
-        print("")
-        print("TriangleStripSet : colors = {0}".format(colors)) # imprime no terminal as cores
+        vertices = len(point) // 3
+        coord_index = []
+        first = 0
+        for count in stripCount:
+            count = int(count)
+            last = min(first + max(count, 0), vertices)
+            if last - first >= 3:
+                faixa = list(range(first, last))
+                for i in range(len(faixa) - 2):
+                    coord_index.extend((faixa[i], faixa[i + 1], faixa[i + 2], -1))
+            first += max(count, 0)
+            if first >= vertices:
+                break
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        if coord_index:
+            GL.indexedFaceSet(point, coord_index, False, None, None,
+                              None, None, colors, None)
 
     @staticmethod
     def indexedTriangleStripSet(point, index, colors):
@@ -423,12 +438,22 @@ class GL:
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("IndexedTriangleStripSet : pontos = {0}, index = {1}".format(point, index))
-        print("IndexedTriangleStripSet : colors = {0}".format(colors)) # imprime as cores
+        faixa = []
+        coord_index = []
+        for value in index:
+            value = int(value)
+            if value == -1:
+                for i in range(len(faixa) - 2):
+                    coord_index.extend((faixa[i], faixa[i + 1], faixa[i + 2], -1))
+                faixa = []
+            else:
+                faixa.append(value)
+        for i in range(len(faixa) - 2):
+            coord_index.extend((faixa[i], faixa[i + 1], faixa[i + 2], -1))
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        if coord_index:
+            GL.indexedFaceSet(point, coord_index, False, None, None,
+                              None, None, colors, None)
 
     @staticmethod
     def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
@@ -455,23 +480,206 @@ class GL:
         # cor da textura conforme a posição do mapeamento. Dentro da classe GPU já está
         # implementadado um método para a leitura de imagens.
 
-        # Os prints abaixo são só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("IndexedFaceSet : ")
-        if coord:
-            print("\tpontos(x, y, z) = {0}, coordIndex = {1}".format(coord, coordIndex))
-        print("colorPerVertex = {0}".format(colorPerVertex))
-        if colorPerVertex and color and colorIndex:
-            print("\tcores(r, g, b) = {0}, colorIndex = {1}".format(color, colorIndex))
-        if texCoord and texCoordIndex:
-            print("\tpontos(u, v) = {0}, texCoordIndex = {1}".format(texCoord, texCoordIndex))
-        if current_texture:
-            image = gpu.GPU.load_texture(current_texture[0])
-            print("\t Matriz com image = {0}".format(image))
-            print("\t Dimensões da image = {0}".format(image.shape))
-        print("IndexedFaceSet : colors = {0}".format(colors))  # imprime no terminal as cores
+        if coord is None or coordIndex is None:
+            return
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        try:
+            vertices = np.asarray(coord, dtype=float).reshape(-1, 3)
+        except (TypeError, ValueError):
+            return
+
+        def split_indices(values):
+            """Divide uma MFInt32 nos grupos separados por -1."""
+            groups = []
+            group = []
+            if values is None:
+                return groups
+            for value in values:
+                value = int(value)
+                if value == -1:
+                    if group:
+                        groups.append(group)
+                        group = []
+                else:
+                    group.append(value)
+            if group:
+                groups.append(group)
+            return groups
+
+        faces = split_indices(coordIndex)
+        if not faces:
+            return
+
+        view = np.asarray(getattr(GL, "view_matrix", np.identity(4)), dtype=float)
+        projection = np.asarray(getattr(GL, "perspective_matrix", np.identity(4)), dtype=float)
+        model = np.asarray(getattr(GL, "transform_matrix", np.identity(4)), dtype=float)
+        mvp = projection @ view @ model
+
+        def project(vertex_index):
+            if vertex_index < 0 or vertex_index >= len(vertices):
+                return None
+            clip = mvp @ np.array([*vertices[vertex_index], 1.0])
+            if not np.all(np.isfinite(clip)) or abs(clip[3]) < 1e-12:
+                return None
+            ndc = clip[:3] / clip[3]
+            if not np.all(np.isfinite(ndc)) or ndc[2] < -1.0 or ndc[2] > 1.0:
+                return None
+            return np.array([
+                (ndc[0] + 1.0) * 0.5 * GL.width,
+                (1.0 - ndc[1]) * 0.5 * GL.height,
+                ndc[2],
+            ])
+
+        def edge(a, b, x, y):
+            return (b[1] - a[1]) * x - (b[0] - a[0]) * y \
+                   + a[1] * (b[0] - a[0]) - a[0] * (b[1] - a[1])
+
+        material_color = [1.0, 1.0, 1.0]
+        if isinstance(colors, dict):
+            material_color = colors.get("emissiveColor", material_color)
+        material_color = np.asarray(material_color, dtype=float).reshape(-1)[:3]
+        if len(material_color) != 3:
+            material_color = np.ones(3, dtype=float)
+        material_color = np.clip(material_color, 0.0, 1.0)
+
+        try:
+            color_values = np.asarray(color, dtype=float).reshape(-1, 3) if color is not None else None
+        except (TypeError, ValueError):
+            color_values = None
+
+        try:
+            tex_values = np.asarray(texCoord, dtype=float).reshape(-1, 2) if texCoord is not None else None
+        except (TypeError, ValueError):
+            tex_values = None
+
+        color_groups = split_indices(colorIndex)
+        tex_groups = split_indices(texCoordIndex)
+        color_has_separators = colorIndex is not None and any(int(v) == -1 for v in colorIndex)
+        tex_has_separators = texCoordIndex is not None and any(int(v) == -1 for v in texCoordIndex)
+        color_stream = 0
+        tex_stream = 0
+
+        texture = None
+        if current_texture:
+            try:
+                texture = gpu.GPU.load_texture(current_texture[0])
+            except (OSError, IOError, IndexError, TypeError):
+                texture = None
+            if texture is not None and not np.any(material_color):
+                material_color = np.ones(3, dtype=float)
+
+        def get_color(index):
+            if color_values is None or index is None:
+                return material_color.copy()
+            if 0 <= int(index) < len(color_values):
+                return np.clip(color_values[int(index)], 0.0, 1.0)
+            return material_color.copy()
+
+        def get_texcoord(index):
+            if tex_values is None or index is None:
+                return None
+            if 0 <= int(index) < len(tex_values):
+                return tex_values[int(index)]
+            return None
+
+        for face_number, face in enumerate(faces):
+            if len(face) < 3:
+                continue
+
+            if colorPerVertex:
+                if color_values is None:
+                    face_color_indices = [None] * len(face)
+                elif colorIndex is None:
+                    face_color_indices = face[:]
+                elif color_has_separators:
+                    face_color_indices = (color_groups[face_number]
+                                          if face_number < len(color_groups) else [])
+                    if len(face_color_indices) < len(face):
+                        face_color_indices += face[len(face_color_indices):]
+                else:
+                    face_color_indices = list(np.asarray(colorIndex, dtype=int)
+                                              [color_stream:color_stream + len(face)])
+                    color_stream += len(face)
+                    if len(face_color_indices) < len(face):
+                        face_color_indices += face[len(face_color_indices):]
+            else:
+                if color_values is None:
+                    face_color_indices = [None] * len(face)
+                elif colorIndex is None:
+                    face_color_indices = [0] * len(face)
+                elif color_has_separators:
+                    selected = color_groups[face_number] if face_number < len(color_groups) else []
+                    selected = selected[0] if selected else face_number
+                    face_color_indices = [selected] * len(face)
+                else:
+                    selected = int(colorIndex[face_number]) if face_number < len(colorIndex) else face_number
+                    face_color_indices = [selected] * len(face)
+
+            if tex_values is None:
+                face_tex_indices = [None] * len(face)
+            elif texCoordIndex is None:
+                face_tex_indices = face[:]
+            elif tex_has_separators:
+                face_tex_indices = (tex_groups[face_number]
+                                    if face_number < len(tex_groups) else [])
+                if len(face_tex_indices) < len(face):
+                    face_tex_indices += face[len(face_tex_indices):]
+            else:
+                face_tex_indices = list(np.asarray(texCoordIndex, dtype=int)
+                                        [tex_stream:tex_stream + len(face)])
+                tex_stream += len(face)
+                if len(face_tex_indices) < len(face):
+                    face_tex_indices += face[len(face_tex_indices):]
+
+            for corner in range(1, len(face) - 1):
+                triangle = [0, corner, corner + 1]
+                screen = [project(face[i]) for i in triangle]
+                if any(value is None for value in screen):
+                    continue
+
+                a, b, c = screen
+                area = edge(a, b, c[0], c[1])
+                if abs(area) < 1e-12:
+                    continue
+
+                vertex_colors = [get_color(face_color_indices[i]) for i in triangle]
+                vertex_tex = [get_texcoord(face_tex_indices[i]) for i in triangle]
+                has_texture_coords = texture is not None and all(value is not None for value in vertex_tex)
+
+                xmin = max(0, int(math.floor(min(a[0], b[0], c[0]))))
+                xmax = min(GL.width - 1, int(math.ceil(max(a[0], b[0], c[0]))))
+                ymin = max(0, int(math.floor(min(a[1], b[1], c[1]))))
+                ymax = min(GL.height - 1, int(math.ceil(max(a[1], b[1], c[1]))))
+
+                for py in range(ymin, ymax + 1):
+                    for px in range(xmin, xmax + 1):
+                        sx, sy = px + 0.5, py + 0.5
+                        weights = np.array([
+                            edge(b, c, sx, sy),
+                            edge(c, a, sx, sy),
+                            edge(a, b, sx, sy),
+                        ]) / area
+                        if np.any(weights < -1e-9):
+                            continue
+
+                        pixel_color = (weights[0] * vertex_colors[0]
+                                        + weights[1] * vertex_colors[1]
+                                        + weights[2] * vertex_colors[2])
+                        if has_texture_coords:
+                            uv = (weights[0] * vertex_tex[0]
+                                  + weights[1] * vertex_tex[1]
+                                  + weights[2] * vertex_tex[2])
+                            image_height, image_width = texture.shape[:2]
+                            tx = min(image_width - 1, max(0, int(uv[0] * (image_width - 1))))
+                            ty = min(image_height - 1, max(0, int((1.0 - uv[1]) * (image_height - 1))))
+                            texel = np.asarray(texture[ty, tx], dtype=float).reshape(-1)[:3]
+                            if len(texel) == 3:
+                                if np.max(texel) > 1.0:
+                                    texel /= 255.0
+                                pixel_color *= texel
+
+                        pixel = np.clip(np.rint(pixel_color * 255.0), 0, 255).astype(int).tolist()
+                        gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, pixel)
 
     @staticmethod
     def box(size, colors):
