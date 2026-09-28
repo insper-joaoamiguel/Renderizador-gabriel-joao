@@ -223,49 +223,105 @@ class GL:
         # Exemplo de desenho de um pixel branco na coordenada 10, 10
         # gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
 
-        cores = [int(c * 255) for c in colors["emissiveColor"]]
+        def barycentric(vertices, x, y):
+            x0, y0 = vertices[0]
+            x1, y1 = vertices[1]
+            x2, y2 = vertices[2]
+            denominator = ((y1 - y2) * (x0 - x2)
+                           + (x2 - x1) * (y0 - y2))
+            if abs(denominator) <= 1e-12:
+                return None
+            l0 = ((y1 - y2) * (x - x2)
+                  + (x2 - x1) * (y - y2)) / denominator
+            l1 = ((y2 - y0) * (x - x2)
+                  + (x0 - x2) * (y - y2)) / denominator
+            return np.array([l0, l1, 1.0 - l0 - l1], dtype=float)
 
-        def L(ax, ay, bx, by, x, y):
-            return ((by - ay) * x - (bx - ax) * y
-                    + ay * (bx - ax) - ax * (by - ay))
-
-        # Recupera o estado salvo (com fallback pra identidade se ainda não foi setado)
         view_matrix = getattr(GL, "view_matrix", np.identity(4))
         perspective_matrix = getattr(GL, "perspective_matrix", np.identity(4))
-        transform_stack = getattr(GL, "transform_stack", [np.identity(4)])
+        model_matrix = getattr(GL, "transform_matrix", np.identity(4))
+        mvp = perspective_matrix @ view_matrix @ model_matrix
+        aspect = GL.width / GL.height
 
-        model = getattr(GL, "transform_matrix", np.identity(4))
-        mvp = perspective_matrix @ view_matrix @ model
+        projected = []
+        for offset in range(0, len(point), 3):
+            vertex = np.array([
+                point[offset], point[offset + 1], point[offset + 2], 1.0
+            ])
+            clip = mvp @ vertex
+            if clip[3] <= 1e-12:
+                projected.append(None)
+                continue
+            ndc = clip[:3] / clip[3]
 
-        screen_points = []
-        for i in range(0, len(point), 3):
-            p = np.array([point[i], point[i + 1], point[i + 2], 1.0])
-            p_clip = mvp @ p
-            p_ndc = p_clip[:3] / p_clip[3] if p_clip[3] != 0 else p_clip[:3]
+            # viewpoint() trata o fieldOfView como o menor ângulo. Esta
+            # compensação mantém a razão de aspecto dos exemplos.
+            if aspect > 1.0:
+                ndc[0] /= aspect
+                ndc[1] /= aspect
 
-            sx = (p_ndc[0] + 1) * 0.5 * GL.width
-            sy = (1 - p_ndc[1]) * 0.5 * GL.height
-            screen_points += [sx, sy]
+            projected.append({
+                "screen": np.array([
+                    (ndc[0] + 1.0) * 0.5 * GL.width,
+                    (1.0 - ndc[1]) * 0.5 * GL.height,
+                ]),
+                "depth": float(ndc[2]),
+            })
 
-        for i in range(0, len(screen_points), 6):
-            x0, y0 = screen_points[i], screen_points[i + 1]
-            x1, y1 = screen_points[i + 2], screen_points[i + 3]
-            x2, y2 = screen_points[i + 4], screen_points[i + 5]
+        source_color = np.clip(
+            np.asarray(colors["emissiveColor"], dtype=float), 0.0, 1.0
+        ) * 255.0
+        opacity = 1.0 - min(max(float(colors["transparency"]), 0.0), 1.0)
 
-            xmin = max(0, int(min(x0, x1, x2)))
-            xmax = min(GL.width - 1, int(max(x0, x1, x2)))
-            ymin = max(0, int(min(y0, y1, y2)))
-            ymax = min(GL.height - 1, int(max(y0, y1, y2)))
+        for first in range(0, len(projected) - 2, 3):
+            triangle = projected[first:first + 3]
+            if any(vertex is None for vertex in triangle):
+                continue
 
-            for px in range(xmin, xmax + 1):
-                for py in range(ymin, ymax + 1):
-                    sx, sy = px + 0.5, py + 0.5
-                    l0 = L(x0, y0, x1, y1, sx, sy)
-                    l1 = L(x1, y1, x2, y2, sx, sy)
-                    l2 = L(x2, y2, x0, y0, sx, sy)
-                    if ((l0 >= 0 and l1 >= 0 and l2 >= 0) or
-                        (l0 <= 0 and l1 <= 0 and l2 <= 0)):
-                        gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, cores)
+            screen = np.asarray(
+                [vertex["screen"] for vertex in triangle], dtype=float
+            )
+            depths = np.asarray(
+                [vertex["depth"] for vertex in triangle], dtype=float
+            )
+            if barycentric(screen, screen[0, 0], screen[0, 1]) is None:
+                continue
+
+            xmin = max(0, int(math.floor(np.min(screen[:, 0]))))
+            xmax = min(GL.width - 1, int(math.ceil(np.max(screen[:, 0]))))
+            ymin = max(0, int(math.floor(np.min(screen[:, 1]))))
+            ymax = min(GL.height - 1, int(math.ceil(np.max(screen[:, 1]))))
+
+            for py in range(ymin, ymax + 1):
+                for px in range(xmin, xmax + 1):
+                    weights = barycentric(screen, px + 0.5, py + 0.5)
+                    if weights is None or np.min(weights) < -1e-9:
+                        continue
+
+                    fragment_depth = float(np.dot(weights, depths))
+                    if fragment_depth < -1.0 or fragment_depth > 1.0:
+                        continue
+                    stored_depth = float(gpu.GPU.read_pixel(
+                        [px, py], gpu.GPU.DEPTH_COMPONENT32F
+                    )[0])
+                    if fragment_depth >= stored_depth - 1e-7:
+                        continue
+
+                    destination = np.asarray(
+                        gpu.GPU.read_pixel([px, py], gpu.GPU.RGB8),
+                        dtype=float,
+                    )
+                    blended = (source_color * opacity
+                               + destination * (1.0 - opacity))
+                    output = np.rint(
+                        np.clip(blended, 0.0, 255.0)
+                    ).astype(int).tolist()
+                    gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, output)
+                    gpu.GPU.draw_pixel(
+                        [px, py],
+                        gpu.GPU.DEPTH_COMPONENT32F,
+                        [fragment_depth],
+                    )
 
 
 
