@@ -223,49 +223,105 @@ class GL:
         # Exemplo de desenho de um pixel branco na coordenada 10, 10
         # gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
 
-        cores = [int(c * 255) for c in colors["emissiveColor"]]
+        def barycentric(vertices, x, y):
+            x0, y0 = vertices[0]
+            x1, y1 = vertices[1]
+            x2, y2 = vertices[2]
+            denominator = ((y1 - y2) * (x0 - x2)
+                           + (x2 - x1) * (y0 - y2))
+            if abs(denominator) <= 1e-12:
+                return None
+            l0 = ((y1 - y2) * (x - x2)
+                  + (x2 - x1) * (y - y2)) / denominator
+            l1 = ((y2 - y0) * (x - x2)
+                  + (x0 - x2) * (y - y2)) / denominator
+            return np.array([l0, l1, 1.0 - l0 - l1], dtype=float)
 
-        def L(ax, ay, bx, by, x, y):
-            return ((by - ay) * x - (bx - ax) * y
-                    + ay * (bx - ax) - ax * (by - ay))
-
-        # Recupera o estado salvo (com fallback pra identidade se ainda não foi setado)
         view_matrix = getattr(GL, "view_matrix", np.identity(4))
         perspective_matrix = getattr(GL, "perspective_matrix", np.identity(4))
-        transform_stack = getattr(GL, "transform_stack", [np.identity(4)])
+        model_matrix = getattr(GL, "transform_matrix", np.identity(4))
+        mvp = perspective_matrix @ view_matrix @ model_matrix
+        aspect = GL.width / GL.height
 
-        model = getattr(GL, "transform_matrix", np.identity(4))
-        mvp = perspective_matrix @ view_matrix @ model
+        projected = []
+        for offset in range(0, len(point), 3):
+            vertex = np.array([
+                point[offset], point[offset + 1], point[offset + 2], 1.0
+            ])
+            clip = mvp @ vertex
+            if clip[3] <= 1e-12:
+                projected.append(None)
+                continue
+            ndc = clip[:3] / clip[3]
 
-        screen_points = []
-        for i in range(0, len(point), 3):
-            p = np.array([point[i], point[i + 1], point[i + 2], 1.0])
-            p_clip = mvp @ p
-            p_ndc = p_clip[:3] / p_clip[3] if p_clip[3] != 0 else p_clip[:3]
+            # viewpoint() trata o fieldOfView como o menor ângulo. Esta
+            # compensação mantém a razão de aspecto dos exemplos.
+            if aspect > 1.0:
+                ndc[0] /= aspect
+                ndc[1] /= aspect
 
-            sx = (p_ndc[0] + 1) * 0.5 * GL.width
-            sy = (1 - p_ndc[1]) * 0.5 * GL.height
-            screen_points += [sx, sy]
+            projected.append({
+                "screen": np.array([
+                    (ndc[0] + 1.0) * 0.5 * GL.width,
+                    (1.0 - ndc[1]) * 0.5 * GL.height,
+                ]),
+                "depth": float(ndc[2]),
+            })
 
-        for i in range(0, len(screen_points), 6):
-            x0, y0 = screen_points[i], screen_points[i + 1]
-            x1, y1 = screen_points[i + 2], screen_points[i + 3]
-            x2, y2 = screen_points[i + 4], screen_points[i + 5]
+        source_color = np.clip(
+            np.asarray(colors["emissiveColor"], dtype=float), 0.0, 1.0
+        ) * 255.0
+        opacity = 1.0 - min(max(float(colors["transparency"]), 0.0), 1.0)
 
-            xmin = max(0, int(min(x0, x1, x2)))
-            xmax = min(GL.width - 1, int(max(x0, x1, x2)))
-            ymin = max(0, int(min(y0, y1, y2)))
-            ymax = min(GL.height - 1, int(max(y0, y1, y2)))
+        for first in range(0, len(projected) - 2, 3):
+            triangle = projected[first:first + 3]
+            if any(vertex is None for vertex in triangle):
+                continue
 
-            for px in range(xmin, xmax + 1):
-                for py in range(ymin, ymax + 1):
-                    sx, sy = px + 0.5, py + 0.5
-                    l0 = L(x0, y0, x1, y1, sx, sy)
-                    l1 = L(x1, y1, x2, y2, sx, sy)
-                    l2 = L(x2, y2, x0, y0, sx, sy)
-                    if ((l0 >= 0 and l1 >= 0 and l2 >= 0) or
-                        (l0 <= 0 and l1 <= 0 and l2 <= 0)):
-                        gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, cores)
+            screen = np.asarray(
+                [vertex["screen"] for vertex in triangle], dtype=float
+            )
+            depths = np.asarray(
+                [vertex["depth"] for vertex in triangle], dtype=float
+            )
+            if barycentric(screen, screen[0, 0], screen[0, 1]) is None:
+                continue
+
+            xmin = max(0, int(math.floor(np.min(screen[:, 0]))))
+            xmax = min(GL.width - 1, int(math.ceil(np.max(screen[:, 0]))))
+            ymin = max(0, int(math.floor(np.min(screen[:, 1]))))
+            ymax = min(GL.height - 1, int(math.ceil(np.max(screen[:, 1]))))
+
+            for py in range(ymin, ymax + 1):
+                for px in range(xmin, xmax + 1):
+                    weights = barycentric(screen, px + 0.5, py + 0.5)
+                    if weights is None or np.min(weights) < -1e-9:
+                        continue
+
+                    fragment_depth = float(np.dot(weights, depths))
+                    if fragment_depth < -1.0 or fragment_depth > 1.0:
+                        continue
+                    stored_depth = float(gpu.GPU.read_pixel(
+                        [px, py], gpu.GPU.DEPTH_COMPONENT32F
+                    )[0])
+                    if fragment_depth >= stored_depth - 1e-7:
+                        continue
+
+                    destination = np.asarray(
+                        gpu.GPU.read_pixel([px, py], gpu.GPU.RGB8),
+                        dtype=float,
+                    )
+                    blended = (source_color * opacity
+                               + destination * (1.0 - opacity))
+                    output = np.rint(
+                        np.clip(blended, 0.0, 255.0)
+                    ).astype(int).tolist()
+                    gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, output)
+                    gpu.GPU.draw_pixel(
+                        [px, py],
+                        gpu.GPU.DEPTH_COMPONENT32F,
+                        [fragment_depth],
+                    )
 
 
 
@@ -455,23 +511,315 @@ class GL:
         # cor da textura conforme a posição do mapeamento. Dentro da classe GPU já está
         # implementadado um método para a leitura de imagens.
 
-        # Os prints abaixo são só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("IndexedFaceSet : ")
-        if coord:
-            print("\tpontos(x, y, z) = {0}, coordIndex = {1}".format(coord, coordIndex))
-        print("colorPerVertex = {0}".format(colorPerVertex))
-        if colorPerVertex and color and colorIndex:
-            print("\tcores(r, g, b) = {0}, colorIndex = {1}".format(color, colorIndex))
-        if texCoord and texCoordIndex:
-            print("\tpontos(u, v) = {0}, texCoordIndex = {1}".format(texCoord, texCoordIndex))
-        if current_texture:
-            image = gpu.GPU.load_texture(current_texture[0])
-            print("\t Matriz com image = {0}".format(image))
-            print("\t Dimensões da image = {0}".format(image.shape))
-        print("IndexedFaceSet : colors = {0}".format(colors))  # imprime no terminal as cores
+        def split_faces(indices):
+            faces, face = [], []
+            for index in indices:
+                if index == -1:
+                    if face:
+                        faces.append(face)
+                        face = []
+                else:
+                    face.append(index)
+            if face:
+                faces.append(face)
+            return faces
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        def barycentric(vertices, x, y):
+            x0, y0 = vertices[0]
+            x1, y1 = vertices[1]
+            x2, y2 = vertices[2]
+            denominator = ((y1 - y2) * (x0 - x2)
+                           + (x2 - x1) * (y0 - y2))
+            if abs(denominator) <= 1e-12:
+                return None
+            l0 = ((y1 - y2) * (x - x2)
+                  + (x2 - x1) * (y - y2)) / denominator
+            l1 = ((y2 - y0) * (x - x2)
+                  + (x0 - x2) * (y - y2)) / denominator
+            return np.array([l0, l1, 1.0 - l0 - l1], dtype=float)
+
+        def perspective(values, weights, inv_w):
+            corrected = weights * inv_w
+            denominator = float(np.sum(corrected))
+            if abs(denominator) <= 1e-12:
+                return None
+            return np.sum(
+                values * corrected[:, None], axis=0
+            ) / denominator
+
+        def project(points):
+            view_matrix = getattr(GL, "view_matrix", np.identity(4))
+            perspective_matrix = getattr(
+                GL, "perspective_matrix", np.identity(4)
+            )
+            model_matrix = getattr(GL, "transform_matrix", np.identity(4))
+            mvp = perspective_matrix @ view_matrix @ model_matrix
+            aspect = GL.width / GL.height
+            result = []
+            for offset in range(0, len(points), 3):
+                vertex = np.array([
+                    points[offset], points[offset + 1], points[offset + 2], 1.0
+                ])
+                clip = mvp @ vertex
+                if clip[3] <= 1e-12:
+                    result.append(None)
+                    continue
+                ndc = clip[:3] / clip[3]
+                if aspect > 1.0:
+                    ndc[0] /= aspect
+                    ndc[1] /= aspect
+                result.append({
+                    "screen": np.array([
+                        (ndc[0] + 1.0) * 0.5 * GL.width,
+                        (1.0 - ndc[1]) * 0.5 * GL.height,
+                    ]),
+                    "depth": float(ndc[2]),
+                    "inv_w": 1.0 / float(clip[3]),
+                })
+            return result
+
+        def make_mipmaps(texture_name):
+            cache = getattr(GL, "_texture_cache", {})
+            key = (gpu.GPU.path, texture_name)
+            if key in cache:
+                return cache[key]
+
+            # load_texture() entrega a matriz indexada por [u][v].
+            image = np.swapaxes(gpu.GPU.load_texture(texture_name), 0, 1)
+            if image.ndim == 2:
+                image = np.repeat(image[:, :, None], 3, axis=2)
+            elif image.shape[2] == 2:
+                image = np.concatenate([
+                    np.repeat(image[:, :, :1], 3, axis=2),
+                    image[:, :, 1:2],
+                ], axis=2)
+            elif image.shape[2] > 4:
+                image = image[:, :, :4]
+
+            levels = [image.astype(np.float32)]
+            while levels[-1].shape[0] > 1 or levels[-1].shape[1] > 1:
+                current = levels[-1]
+                height, width = current.shape[:2]
+                padded = np.pad(
+                    current,
+                    ((0, height % 2), (0, width % 2), (0, 0)),
+                    mode="edge",
+                )
+                levels.append(padded.reshape(
+                    padded.shape[0] // 2, 2,
+                    padded.shape[1] // 2, 2,
+                    padded.shape[2],
+                ).mean(axis=(1, 3)))
+
+            cache[key] = levels
+            GL._texture_cache = cache
+            return levels
+
+        def sample_level(image, uv):
+            height, width = image.shape[:2]
+            u = min(max(float(uv[0]), 0.0), 1.0)
+            v = min(max(float(uv[1]), 0.0), 1.0)
+            x = u * (width - 1)
+            y = (1.0 - v) * (height - 1)
+            x0, y0 = int(math.floor(x)), int(math.floor(y))
+            x1, y1 = min(x0 + 1, width - 1), min(y0 + 1, height - 1)
+            tx, ty = x - x0, y - y0
+            top = image[y0, x0] * (1.0 - tx) + image[y0, x1] * tx
+            bottom = image[y1, x0] * (1.0 - tx) + image[y1, x1] * tx
+            return top * (1.0 - ty) + bottom * ty
+
+        def sample_texture(levels, uv, lod):
+            lod = min(max(float(lod), 0.0), len(levels) - 1)
+            first = int(math.floor(lod))
+            second = min(first + 1, len(levels) - 1)
+            fraction = lod - first
+            sample = (sample_level(levels[first], uv) * (1.0 - fraction)
+                      + sample_level(levels[second], uv) * fraction)
+            if sample.shape[0] >= 4:
+                return sample[:3], float(sample[3]) / 255.0
+            return sample[:3], 1.0
+
+        def rasterize(vertices, vertex_colors, texture_coordinates, levels):
+            if any(vertex is None for vertex in vertices):
+                return
+
+            screen = np.asarray(
+                [vertex["screen"] for vertex in vertices], dtype=float
+            )
+            depths = np.asarray(
+                [vertex["depth"] for vertex in vertices], dtype=float
+            )
+            inv_w = np.asarray(
+                [vertex["inv_w"] for vertex in vertices], dtype=float
+            )
+            if barycentric(screen, screen[0, 0], screen[0, 1]) is None:
+                return
+
+            xmin = max(0, int(math.floor(np.min(screen[:, 0]))))
+            xmax = min(GL.width - 1, int(math.ceil(np.max(screen[:, 0]))))
+            ymin = max(0, int(math.floor(np.min(screen[:, 1]))))
+            ymax = min(GL.height - 1, int(math.ceil(np.max(screen[:, 1]))))
+
+            delta_x = delta_y = None
+            if texture_coordinates is not None and levels:
+                origin = barycentric(screen, 0.0, 0.0)
+                rate = getattr(GL, "sample_rate", 2)
+                delta_x = barycentric(screen, rate, 0.0) - origin
+                delta_y = barycentric(screen, 0.0, rate) - origin
+
+            material_color = np.clip(
+                np.asarray(colors["emissiveColor"], dtype=float), 0.0, 1.0
+            ) * 255.0
+            opacity = 1.0 - min(
+                max(float(colors["transparency"]), 0.0), 1.0
+            )
+
+            for py in range(ymin, ymax + 1):
+                for px in range(xmin, xmax + 1):
+                    weights = barycentric(screen, px + 0.5, py + 0.5)
+                    if weights is None or np.min(weights) < -1e-9:
+                        continue
+
+                    fragment_depth = float(np.dot(weights, depths))
+                    if fragment_depth < -1.0 or fragment_depth > 1.0:
+                        continue
+                    stored_depth = float(gpu.GPU.read_pixel(
+                        [px, py], gpu.GPU.DEPTH_COMPONENT32F
+                    )[0])
+                    if fragment_depth >= stored_depth - 1e-7:
+                        continue
+
+                    fragment_color = material_color
+                    fragment_opacity = opacity
+                    if vertex_colors is not None:
+                        interpolated = perspective(vertex_colors, weights, inv_w)
+                        if interpolated is None:
+                            continue
+                        fragment_color = np.clip(
+                            interpolated, 0.0, 1.0
+                        ) * 255.0
+
+                    if texture_coordinates is not None and levels:
+                        uv = perspective(texture_coordinates, weights, inv_w)
+                        uv_x = perspective(
+                            texture_coordinates, weights + delta_x, inv_w
+                        )
+                        uv_y = perspective(
+                            texture_coordinates, weights + delta_y, inv_w
+                        )
+                        if uv is None or uv_x is None or uv_y is None:
+                            continue
+
+                        tex_height, tex_width = levels[0].shape[:2]
+                        dx = np.array([
+                            (uv_x[0] - uv[0]) * tex_width,
+                            (uv_x[1] - uv[1]) * tex_height,
+                        ])
+                        dy = np.array([
+                            (uv_y[0] - uv[0]) * tex_width,
+                            (uv_y[1] - uv[1]) * tex_height,
+                        ])
+                        footprint = max(
+                            np.linalg.norm(dx), np.linalg.norm(dy), 1.0
+                        )
+                        texture_color, texture_alpha = sample_texture(
+                            levels, uv, math.log2(footprint)
+                        )
+                        if vertex_colors is not None:
+                            fragment_color = (
+                                texture_color * fragment_color / 255.0
+                            )
+                        else:
+                            fragment_color = texture_color
+                        fragment_opacity *= texture_alpha
+
+                    destination = np.asarray(
+                        gpu.GPU.read_pixel([px, py], gpu.GPU.RGB8), dtype=float
+                    )
+                    blended = (fragment_color * fragment_opacity
+                               + destination * (1.0 - fragment_opacity))
+                    output = np.rint(
+                        np.clip(blended, 0.0, 255.0)
+                    ).astype(int).tolist()
+                    gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, output)
+                    gpu.GPU.draw_pixel(
+                        [px, py], gpu.GPU.DEPTH_COMPONENT32F, [fragment_depth]
+                    )
+
+        if coord is None or not coord or not coordIndex:
+            return
+
+        projected = project(coord)
+        coordinate_faces = split_faces(coordIndex)
+        color_faces = split_faces(colorIndex) if colorIndex else []
+        texture_faces = split_faces(texCoordIndex) if texCoordIndex else []
+        color_values = (np.asarray(color, dtype=float).reshape((-1, 3))
+                        if color else None)
+        texture_values = (np.asarray(texCoord, dtype=float).reshape((-1, 2))
+                          if texCoord else None)
+        levels = None
+        if current_texture and texture_values is not None:
+            levels = make_mipmaps(current_texture[0])
+
+        flat_color_indices = [value for value in colorIndex if value != -1]
+        for face_number, coordinate_face in enumerate(coordinate_faces):
+            if len(coordinate_face) < 3:
+                continue
+
+            if colorPerVertex:
+                vertex_color_indices = coordinate_face
+                if face_number < len(color_faces):
+                    vertex_color_indices = color_faces[face_number]
+                face_color_index = None
+            else:
+                vertex_color_indices = None
+                face_color_index = (flat_color_indices[face_number]
+                                    if face_number < len(flat_color_indices)
+                                    else face_number)
+
+            texture_face = (texture_faces[face_number]
+                            if face_number < len(texture_faces)
+                            else coordinate_face)
+
+            for corner in range(1, len(coordinate_face) - 1):
+                local_indices = [0, corner, corner + 1]
+                coordinate_indices = [
+                    coordinate_face[index] for index in local_indices
+                ]
+                if any(index < 0 or index >= len(projected)
+                       for index in coordinate_indices):
+                    continue
+                vertices = [projected[index] for index in coordinate_indices]
+
+                triangle_colors = None
+                if color_values is not None:
+                    if colorPerVertex:
+                        if max(local_indices) >= len(vertex_color_indices):
+                            continue
+                        indices = [
+                            vertex_color_indices[index]
+                            for index in local_indices
+                        ]
+                        if any(index < 0 or index >= len(color_values)
+                               for index in indices):
+                            continue
+                        triangle_colors = color_values[indices]
+                    elif 0 <= face_color_index < len(color_values):
+                        triangle_colors = np.repeat(
+                            color_values[face_color_index][None, :], 3, axis=0
+                        )
+
+                triangle_texcoords = None
+                if (texture_values is not None
+                        and len(texture_face) > max(local_indices)):
+                    indices = [texture_face[index] for index in local_indices]
+                    if all(0 <= index < len(texture_values)
+                           for index in indices):
+                        triangle_texcoords = texture_values[indices]
+
+                rasterize(
+                    vertices, triangle_colors, triangle_texcoords, levels
+                )
 
     @staticmethod
     def box(size, colors):
