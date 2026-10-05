@@ -31,6 +31,13 @@ class GL:
         GL.height = height
         GL.near = near
         GL.far = far
+        # Estados que pertencem a um quadro/cena nova não devem vazar de uma
+        # execução anterior do renderizador.
+        GL.lights = []
+        GL.headlight = True
+        GL.time_sensor_states = {}
+        GL.transform_matrix = np.identity(4)
+        GL.transform_stack = []
 
     @staticmethod
     def polypoint2D(point, colors):
@@ -223,105 +230,15 @@ class GL:
         # Exemplo de desenho de um pixel branco na coordenada 10, 10
         # gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
 
-        def barycentric(vertices, x, y):
-            x0, y0 = vertices[0]
-            x1, y1 = vertices[1]
-            x2, y2 = vertices[2]
-            denominator = ((y1 - y2) * (x0 - x2)
-                           + (x2 - x1) * (y0 - y2))
-            if abs(denominator) <= 1e-12:
-                return None
-            l0 = ((y1 - y2) * (x - x2)
-                  + (x2 - x1) * (y - y2)) / denominator
-            l1 = ((y2 - y0) * (x - x2)
-                  + (x0 - x2) * (y - y2)) / denominator
-            return np.array([l0, l1, 1.0 - l0 - l1], dtype=float)
+        # O mesmo rasterizador é utilizado pelas geometrias indexadas. Assim
+        # TriangleSet recebe também profundidade, materiais e iluminação.
+        coord_index = []
+        for first in range(0, len(point) // 3 - 2, 3):
+            coord_index.extend((first, first + 1, first + 2, -1))
 
-        view_matrix = getattr(GL, "view_matrix", np.identity(4))
-        perspective_matrix = getattr(GL, "perspective_matrix", np.identity(4))
-        model_matrix = getattr(GL, "transform_matrix", np.identity(4))
-        mvp = perspective_matrix @ view_matrix @ model_matrix
-        aspect = GL.width / GL.height
-
-        projected = []
-        for offset in range(0, len(point), 3):
-            vertex = np.array([
-                point[offset], point[offset + 1], point[offset + 2], 1.0
-            ])
-            clip = mvp @ vertex
-            if clip[3] <= 1e-12:
-                projected.append(None)
-                continue
-            ndc = clip[:3] / clip[3]
-
-            # viewpoint() trata o fieldOfView como o menor ângulo. Esta
-            # compensação mantém a razão de aspecto dos exemplos.
-            if aspect > 1.0:
-                ndc[0] /= aspect
-                ndc[1] /= aspect
-
-            projected.append({
-                "screen": np.array([
-                    (ndc[0] + 1.0) * 0.5 * GL.width,
-                    (1.0 - ndc[1]) * 0.5 * GL.height,
-                ]),
-                "depth": float(ndc[2]),
-            })
-
-        source_color = np.clip(
-            np.asarray(colors["emissiveColor"], dtype=float), 0.0, 1.0
-        ) * 255.0
-        opacity = 1.0 - min(max(float(colors["transparency"]), 0.0), 1.0)
-
-        for first in range(0, len(projected) - 2, 3):
-            triangle = projected[first:first + 3]
-            if any(vertex is None for vertex in triangle):
-                continue
-
-            screen = np.asarray(
-                [vertex["screen"] for vertex in triangle], dtype=float
-            )
-            depths = np.asarray(
-                [vertex["depth"] for vertex in triangle], dtype=float
-            )
-            if barycentric(screen, screen[0, 0], screen[0, 1]) is None:
-                continue
-
-            xmin = max(0, int(math.floor(np.min(screen[:, 0]))))
-            xmax = min(GL.width - 1, int(math.ceil(np.max(screen[:, 0]))))
-            ymin = max(0, int(math.floor(np.min(screen[:, 1]))))
-            ymax = min(GL.height - 1, int(math.ceil(np.max(screen[:, 1]))))
-
-            for py in range(ymin, ymax + 1):
-                for px in range(xmin, xmax + 1):
-                    weights = barycentric(screen, px + 0.5, py + 0.5)
-                    if weights is None or np.min(weights) < -1e-9:
-                        continue
-
-                    fragment_depth = float(np.dot(weights, depths))
-                    if fragment_depth < -1.0 or fragment_depth > 1.0:
-                        continue
-                    stored_depth = float(gpu.GPU.read_pixel(
-                        [px, py], gpu.GPU.DEPTH_COMPONENT32F
-                    )[0])
-                    if fragment_depth >= stored_depth - 1e-7:
-                        continue
-
-                    destination = np.asarray(
-                        gpu.GPU.read_pixel([px, py], gpu.GPU.RGB8),
-                        dtype=float,
-                    )
-                    blended = (source_color * opacity
-                               + destination * (1.0 - opacity))
-                    output = np.rint(
-                        np.clip(blended, 0.0, 255.0)
-                    ).astype(int).tolist()
-                    gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, output)
-                    gpu.GPU.draw_pixel(
-                        [px, py],
-                        gpu.GPU.DEPTH_COMPONENT32F,
-                        [fragment_depth],
-                    )
+        if coord_index:
+            GL.indexedFaceSet(point, coord_index, False, None, None,
+                              None, None, colors, None)
 
 
 
@@ -360,6 +277,8 @@ class GL:
 
         # Guarda o estado como atributo dinâmico da classe GL
         setattr(GL, "view_matrix", np.linalg.inv(camera_matrix))
+        setattr(GL, "camera_position", np.asarray(position, dtype=float))
+        setattr(GL, "camera_direction", R[:3, :3] @ np.array([0.0, 0.0, -1.0]))
 
         aspect = GL.width / GL.height
         f = 1.0 / math.tan(fieldOfView / 2)
@@ -469,7 +388,13 @@ class GL:
             if last - first >= 3:
                 faixa = list(range(first, last))
                 for i in range(len(faixa) - 2):
-                    coord_index.extend((faixa[i], faixa[i + 1], faixa[i + 2], -1))
+                    # A orientação do winding alterna em uma triangle strip.
+                    # Corrigi-la aqui mantém o mesmo lado da face iluminado.
+                    if i % 2:
+                        triangle = (faixa[i + 1], faixa[i], faixa[i + 2])
+                    else:
+                        triangle = (faixa[i], faixa[i + 1], faixa[i + 2])
+                    coord_index.extend((*triangle, -1))
             first += max(count, 0)
             if first >= vertices:
                 break
@@ -500,12 +425,20 @@ class GL:
             value = int(value)
             if value == -1:
                 for i in range(len(faixa) - 2):
-                    coord_index.extend((faixa[i], faixa[i + 1], faixa[i + 2], -1))
+                    if i % 2:
+                        triangle = (faixa[i + 1], faixa[i], faixa[i + 2])
+                    else:
+                        triangle = (faixa[i], faixa[i + 1], faixa[i + 2])
+                    coord_index.extend((*triangle, -1))
                 faixa = []
             else:
                 faixa.append(value)
         for i in range(len(faixa) - 2):
-            coord_index.extend((faixa[i], faixa[i + 1], faixa[i + 2], -1))
+            if i % 2:
+                triangle = (faixa[i + 1], faixa[i], faixa[i + 2])
+            else:
+                triangle = (faixa[i], faixa[i + 1], faixa[i + 2])
+            coord_index.extend((*triangle, -1))
 
         if coord_index:
             GL.indexedFaceSet(point, coord_index, False, None, None,
@@ -571,32 +504,64 @@ class GL:
         model = np.asarray(getattr(GL, "transform_matrix", np.identity(4)), dtype=float)
         mvp = projection @ view @ model
 
+        def normalize(vector, fallback=None):
+            vector = np.asarray(vector, dtype=float)
+            length = np.linalg.norm(vector)
+            if length > 1e-12:
+                return vector / length
+            if fallback is None:
+                return np.zeros_like(vector)
+            return np.asarray(fallback, dtype=float)
+
         def project(vertex_index):
             if vertex_index < 0 or vertex_index >= len(vertices):
                 return None
-            clip = mvp @ np.array([*vertices[vertex_index], 1.0])
+            local = np.array([*vertices[vertex_index], 1.0], dtype=float)
+            world_h = model @ local
+            if abs(world_h[3]) < 1e-12:
+                return None
+            world = world_h[:3] / world_h[3]
+            clip = mvp @ local
             if not np.all(np.isfinite(clip)) or abs(clip[3]) < 1e-12:
                 return None
             ndc = clip[:3] / clip[3]
             if not np.all(np.isfinite(ndc)) or ndc[2] < -1.0 or ndc[2] > 1.0:
                 return None
-            return np.array([
-                (ndc[0] + 1.0) * 0.5 * GL.width,
-                (1.0 - ndc[1]) * 0.5 * GL.height,
-                ndc[2],
-            ])
+            return {
+                "screen": np.array([
+                    (ndc[0] + 1.0) * 0.5 * GL.width,
+                    (1.0 - ndc[1]) * 0.5 * GL.height,
+                ]),
+                "depth": float(ndc[2]),
+                "world": world,
+            }
 
         def edge(a, b, x, y):
             return (b[1] - a[1]) * x - (b[0] - a[0]) * y \
                    + a[1] * (b[0] - a[0]) - a[0] * (b[1] - a[1])
 
-        material_color = [1.0, 1.0, 1.0]
-        if isinstance(colors, dict):
-            material_color = colors.get("emissiveColor", material_color)
-        material_color = np.asarray(material_color, dtype=float).reshape(-1)[:3]
-        if len(material_color) != 3:
-            material_color = np.ones(3, dtype=float)
-        material_color = np.clip(material_color, 0.0, 1.0)
+        def rgb(name, default):
+            value = colors.get(name, default) if isinstance(colors, dict) else default
+            try:
+                value = np.asarray(value, dtype=float).reshape(-1)[:3]
+            except (TypeError, ValueError):
+                value = np.asarray(default, dtype=float)
+            if len(value) != 3:
+                value = np.asarray(default, dtype=float)
+            return np.clip(value, 0.0, 1.0)
+
+        material_diffuse = rgb("diffuseColor", [0.8, 0.8, 0.8])
+        material_emissive = rgb("emissiveColor", [0.0, 0.0, 0.0])
+        material_specular = rgb("specularColor", [0.0, 0.0, 0.0])
+        try:
+            material_ambient = float(colors.get("ambientIntensity", 0.2))
+            material_shininess = float(colors.get("shininess", 0.2))
+            transparency = float(colors.get("transparency", 0.0))
+        except (AttributeError, TypeError, ValueError):
+            material_ambient, material_shininess, transparency = 0.2, 0.2, 0.0
+        material_ambient = min(max(material_ambient, 0.0), 1.0)
+        material_shininess = min(max(material_shininess, 0.0), 1.0)
+        opacity = 1.0 - min(max(transparency, 0.0), 1.0)
 
         try:
             color_values = np.asarray(color, dtype=float).reshape(-1, 3) if color is not None else None
@@ -621,15 +586,13 @@ class GL:
                 texture = gpu.GPU.load_texture(current_texture[0])
             except (OSError, IOError, IndexError, TypeError):
                 texture = None
-            if texture is not None and not np.any(material_color):
-                material_color = np.ones(3, dtype=float)
 
         def get_color(index):
             if color_values is None or index is None:
-                return material_color.copy()
+                return material_diffuse.copy()
             if 0 <= int(index) < len(color_values):
                 return np.clip(color_values[int(index)], 0.0, 1.0)
-            return material_color.copy()
+            return material_diffuse.copy()
 
         def get_texcoord(index):
             if tex_values is None or index is None:
@@ -637,6 +600,60 @@ class GL:
             if 0 <= int(index) < len(tex_values):
                 return tex_values[int(index)]
             return None
+
+        camera_position = np.asarray(
+            getattr(GL, "camera_position", [0.0, 0.0, 0.0]), dtype=float
+        )
+        # O rasterizador já garante os limites dos pixels. Acesso direto aos
+        # arrays evita a validação Python da GPU simulada para cada fragmento.
+        framebuffer = gpu.GPU.frame_buffer[gpu.GPU.draw_framebuffer]
+        color_buffer = framebuffer.color
+        depth_buffer = framebuffer.depth
+        lights = list(getattr(GL, "lights", []))
+        if getattr(GL, "headlight", True):
+            head_direction = getattr(GL, "camera_direction", [0.0, 0.0, -1.0])
+            lights.insert(0, {
+                "ambientIntensity": 0.0,
+                "color": np.ones(3, dtype=float),
+                "intensity": 1.0,
+                "direction": normalize(head_direction, [0.0, 0.0, -1.0]),
+            })
+
+        def shade(base_color, normal, position):
+            """Calcula emissiva + ambiente + difusa + especular por fragmento."""
+            base_color = np.clip(np.asarray(base_color, dtype=float), 0.0, 1.0)
+            normal = normalize(normal, [0.0, 0.0, 1.0])
+            to_camera = normalize(camera_position - position, [0.0, 0.0, 1.0])
+
+            # Como o rasterizador não faz descarte de back-face, usa a normal
+            # do lado visível para obter o comportamento de uma superfície 2D.
+            if np.dot(normal, to_camera) < 0.0:
+                normal = -normal
+
+            result = material_emissive.copy()
+            exponent = max(1.0, material_shininess * 128.0)
+            for light in lights:
+                light_color = np.clip(np.asarray(light["color"], dtype=float), 0.0, 1.0)
+                light_intensity = max(float(light["intensity"]), 0.0)
+                light_direction = normalize(light["direction"], [0.0, 0.0, -1.0])
+                to_light = -light_direction
+                diffuse_factor = max(float(np.dot(normal, to_light)), 0.0)
+
+                result += (base_color * light_color * light_intensity
+                           * diffuse_factor)
+                result += (base_color * light_color * light_intensity
+                           * material_ambient
+                           * min(max(float(light["ambientIntensity"]), 0.0), 1.0))
+
+                if diffuse_factor > 0.0 and np.any(material_specular):
+                    reflected = normalize(
+                        2.0 * diffuse_factor * normal - to_light,
+                        [0.0, 0.0, 1.0],
+                    )
+                    specular_factor = max(float(np.dot(reflected, to_camera)), 0.0)
+                    result += (material_specular * light_color * light_intensity
+                               * (specular_factor ** exponent))
+            return np.clip(result, 0.0, 1.0)
 
         for face_number, face in enumerate(faces):
             if len(face) < 3:
@@ -689,15 +706,20 @@ class GL:
 
             for corner in range(1, len(face) - 1):
                 triangle = [0, corner, corner + 1]
-                screen = [project(face[i]) for i in triangle]
-                if any(value is None for value in screen):
+                vertex_indices = [face[i] for i in triangle]
+                projected = [project(index) for index in vertex_indices]
+                if any(value is None for value in projected):
                     continue
 
-                a, b, c = screen
+                a, b, c = [vertex["screen"] for vertex in projected]
                 area = edge(a, b, c[0], c[1])
                 if abs(area) < 1e-12:
                     continue
 
+                positions = np.asarray([vertex["world"] for vertex in projected])
+                normal = np.cross(positions[1] - positions[0], positions[2] - positions[0])
+                if np.linalg.norm(normal) < 1e-12:
+                    continue
                 vertex_colors = [get_color(face_color_indices[i]) for i in triangle]
                 vertex_tex = [get_texcoord(face_tex_indices[i]) for i in triangle]
                 has_texture_coords = texture is not None and all(value is not None for value in vertex_tex)
@@ -718,9 +740,22 @@ class GL:
                         if np.any(weights < -1e-9):
                             continue
 
-                        pixel_color = (weights[0] * vertex_colors[0]
-                                        + weights[1] * vertex_colors[1]
-                                        + weights[2] * vertex_colors[2])
+                        fragment_depth = float(np.dot(
+                            weights, [vertex["depth"] for vertex in projected]
+                        ))
+                        if fragment_depth < -1.0 or fragment_depth > 1.0:
+                            continue
+                        stored_depth = (float(depth_buffer[py, px, 0])
+                                        if depth_buffer.size else 1.0)
+                        if fragment_depth >= stored_depth - 1e-7:
+                            continue
+
+                        position = (weights[0] * positions[0]
+                                    + weights[1] * positions[1]
+                                    + weights[2] * positions[2])
+                        base_color = (weights[0] * vertex_colors[0]
+                                      + weights[1] * vertex_colors[1]
+                                      + weights[2] * vertex_colors[2])
                         if has_texture_coords:
                             uv = (weights[0] * vertex_tex[0]
                                   + weights[1] * vertex_tex[1]
@@ -732,10 +767,16 @@ class GL:
                             if len(texel) == 3:
                                 if np.max(texel) > 1.0:
                                     texel /= 255.0
-                                pixel_color *= texel
+                                base_color *= texel
 
-                        pixel = np.clip(np.rint(pixel_color * 255.0), 0, 255).astype(int).tolist()
-                        gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, pixel)
+                        pixel_color = shade(base_color, normal, position)
+                        destination = np.asarray(color_buffer[py, px], dtype=float)
+                        blended = pixel_color * 255.0 * opacity \
+                            + destination * (1.0 - opacity)
+                        pixel = np.clip(np.rint(blended), 0, 255).astype(int).tolist()
+                        color_buffer[py, px] = pixel
+                        if opacity >= 0.999:
+                            depth_buffer[py, px, 0] = fragment_depth
 
     @staticmethod
     def box(size, colors):
@@ -811,8 +852,10 @@ class GL:
         # A luz headlight deve ser direcional, ter intensidade = 1, cor = (1 1 1),
         # ambientIntensity = 0,0 e direção = (0 0 −1).
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("NavigationInfo : headlight = {0}".format(headlight)) # imprime no terminal
+        # NavigationInfo é o primeiro nó renderizado em cada quadro. Portanto,
+        # ele também delimita o estado das luzes do quadro anterior.
+        setattr(GL, "headlight", bool(headlight))
+        setattr(GL, "lights", [])
 
     @staticmethod
     def directionalLight(ambientIntensity, color, intensity, direction):
@@ -824,11 +867,30 @@ class GL:
         # que emana da fonte de luz no sistema de coordenadas local. A luz é emitida ao
         # longo de raios paralelos de uma distância infinita.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("DirectionalLight : ambientIntensity = {0}".format(ambientIntensity))
-        print("DirectionalLight : color = {0}".format(color)) # imprime no terminal
-        print("DirectionalLight : intensity = {0}".format(intensity)) # imprime no terminal
-        print("DirectionalLight : direction = {0}".format(direction)) # imprime no terminal
+        direction = np.asarray(direction, dtype=float).reshape(-1)[:3]
+        if len(direction) != 3 or np.linalg.norm(direction) <= 1e-12:
+            return
+
+        # A direção pertence ao espaço local da luz. A transformação linear
+        # atual permite que a rotina continue correta caso a luz esteja dentro
+        # de um Transform.
+        model = np.asarray(getattr(GL, "transform_matrix", np.identity(4)), dtype=float)
+        direction = model[:3, :3] @ direction
+        direction /= np.linalg.norm(direction)
+        light_color = np.asarray(color, dtype=float).reshape(-1)[:3]
+        if len(light_color) != 3:
+            light_color = np.ones(3, dtype=float)
+
+        lights = getattr(GL, "lights", None)
+        if lights is None:
+            lights = []
+            setattr(GL, "lights", lights)
+        lights.append({
+            "ambientIntensity": float(ambientIntensity),
+            "color": np.clip(light_color, 0.0, 1.0),
+            "intensity": float(intensity),
+            "direction": direction,
+        })
 
     @staticmethod
     def pointLight(ambientIntensity, color, intensity, location):
@@ -876,15 +938,26 @@ class GL:
 
         # Deve retornar a fração de tempo passada em fraction_changed
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TimeSensor : cycleInterval = {0}".format(cycleInterval)) # imprime no terminal
-        print("TimeSensor : loop = {0}".format(loop))
+        try:
+            cycle_interval = float(cycleInterval)
+        except (TypeError, ValueError):
+            return 0.0
+        if cycle_interval <= 0.0:
+            return 0.0
 
-        # Esse método já está implementado para os alunos como exemplo
-        epoch = time.time()  # time in seconds since the epoch as a floating point number.
-        fraction_changed = (epoch % cycleInterval) / cycleInterval
+        # O instante inicial fica associado aos parâmetros do sensor. Isso
+        # evita que a fração dependa do horário do sistema e permite tratar
+        # corretamente loop=false ao final do ciclo.
+        states = getattr(GL, "time_sensor_states", {})
+        key = (cycle_interval, bool(loop))
+        if key not in states:
+            states[key] = time.monotonic()
+            setattr(GL, "time_sensor_states", states)
 
-        return fraction_changed
+        elapsed = max(0.0, time.monotonic() - states[key])
+        if loop:
+            return (elapsed % cycle_interval) / cycle_interval
+        return min(elapsed / cycle_interval, 1.0)
 
     @staticmethod
     def splinePositionInterpolator(set_fraction, key, keyValue, closed):
@@ -898,16 +971,50 @@ class GL:
         # como fechada, com uma transições da última chave para a primeira chave. Se os keyValues
         # na primeira e na última chave não forem idênticos, o campo closed será ignorado.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("SplinePositionInterpolator : set_fraction = {0}".format(set_fraction))
-        print("SplinePositionInterpolator : key = {0}".format(key)) # imprime no terminal
-        print("SplinePositionInterpolator : keyValue = {0}".format(keyValue))
-        print("SplinePositionInterpolator : closed = {0}".format(closed))
+        try:
+            keys = np.asarray(key, dtype=float).reshape(-1)
+            values = np.asarray(keyValue, dtype=float).reshape(-1, 3)
+            fraction = float(set_fraction)
+        except (TypeError, ValueError):
+            return [0.0, 0.0, 0.0]
 
-        # Abaixo está só um exemplo de como os dados podem ser calculados e transferidos
-        value_changed = [0.0, 0.0, 0.0]
-        
-        return value_changed
+        count = min(len(keys), len(values))
+        if count == 0:
+            return [0.0, 0.0, 0.0]
+        if count == 1:
+            return values[0].tolist()
+        keys = keys[:count]
+        values = values[:count]
+
+        fraction = min(max(fraction, float(keys[0])), float(keys[-1]))
+        segment = int(np.searchsorted(keys, fraction, side="right") - 1)
+        segment = min(max(segment, 0), count - 2)
+        left, right = float(keys[segment]), float(keys[segment + 1])
+        parameter = 0.0 if right <= left else (fraction - left) / (right - left)
+
+        is_closed = bool(closed) and np.allclose(values[0], values[-1])
+
+        def control(index):
+            if is_closed:
+                return values[index % (count - 1)]
+            return values[min(max(index, 0), count - 1)]
+
+        p0 = control(segment - 1)
+        p1 = control(segment)
+        p2 = control(segment + 1)
+        p3 = control(segment + 2)
+
+        # Hermite/Catmull-Rom com tangentes centradas produz a transição
+        # suave exigida pelo SplinePositionInterpolator.
+        t = parameter
+        t2, t3 = t * t, t * t * t
+        tangent1 = 0.5 * (p2 - p0)
+        tangent2 = 0.5 * (p3 - p1)
+        result = ((2.0 * t3 - 3.0 * t2 + 1.0) * p1
+                  + (t3 - 2.0 * t2 + t) * tangent1
+                  + (-2.0 * t3 + 3.0 * t2) * p2
+                  + (t3 - t2) * tangent2)
+        return result.tolist()
 
     @staticmethod
     def orientationInterpolator(set_fraction, key, keyValue):
@@ -924,15 +1031,70 @@ class GL:
         # zeroa a um. O campo keyValue deve conter exatamente tantas rotações 3D quanto os
         # quadros-chave no key.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("OrientationInterpolator : set_fraction = {0}".format(set_fraction))
-        print("OrientationInterpolator : key = {0}".format(key)) # imprime no terminal
-        print("OrientationInterpolator : keyValue = {0}".format(keyValue))
+        try:
+            keys = np.asarray(key, dtype=float).reshape(-1)
+            rotations = np.asarray(keyValue, dtype=float).reshape(-1, 4)
+            fraction = float(set_fraction)
+        except (TypeError, ValueError):
+            return [0.0, 0.0, 1.0, 0.0]
 
-        # Abaixo está só um exemplo de como os dados podem ser calculados e transferidos
-        value_changed = [0, 0, 1, 0]
+        count = min(len(keys), len(rotations))
+        if count == 0:
+            return [0.0, 0.0, 1.0, 0.0]
+        if count == 1:
+            return rotations[0].tolist()
+        keys = keys[:count]
+        rotations = rotations[:count]
+        fraction = min(max(fraction, float(keys[0])), float(keys[-1]))
+        segment = int(np.searchsorted(keys, fraction, side="right") - 1)
+        segment = min(max(segment, 0), count - 2)
+        left, right = float(keys[segment]), float(keys[segment + 1])
+        parameter = 0.0 if right <= left else (fraction - left) / (right - left)
 
-        return value_changed
+        def normalize(vector, fallback=None):
+            vector = np.asarray(vector, dtype=float)
+            length = np.linalg.norm(vector)
+            if length > 1e-12:
+                return vector / length
+            if fallback is None:
+                return np.zeros_like(vector)
+            return np.asarray(fallback, dtype=float)
+
+        def quaternion(rotation):
+            axis = normalize(rotation[:3], [0.0, 0.0, 1.0])
+            half = float(rotation[3]) * 0.5
+            return np.array([
+                math.cos(half),
+                axis[0] * math.sin(half),
+                axis[1] * math.sin(half),
+                axis[2] * math.sin(half),
+            ])
+
+        def axis_angle(quat):
+            quat = quat / max(np.linalg.norm(quat), 1e-12)
+            scalar = min(max(float(quat[0]), -1.0), 1.0)
+            angle = 2.0 * math.acos(scalar)
+            sine = math.sin(angle * 0.5)
+            if abs(sine) <= 1e-8:
+                return np.array([0.0, 0.0, 1.0, 0.0])
+            return np.array([quat[1] / sine, quat[2] / sine,
+                             quat[3] / sine, angle])
+
+        first = quaternion(rotations[segment])
+        second = quaternion(rotations[segment + 1])
+        dot = float(np.dot(first, second))
+        if dot < 0.0:
+            second = -second
+            dot = -dot
+
+        if dot > 0.9995:
+            interpolated = first + parameter * (second - first)
+        else:
+            angle = math.acos(min(max(dot, -1.0), 1.0))
+            sine = math.sin(angle)
+            interpolated = ((math.sin((1.0 - parameter) * angle) * first
+                             + math.sin(parameter * angle) * second) / sine)
+        return axis_angle(interpolated).tolist()
 
     # Para o futuro (Não para versão atual do projeto.)
     def vertex_shader(self, shader):

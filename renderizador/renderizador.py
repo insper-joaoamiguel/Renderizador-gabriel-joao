@@ -36,9 +36,9 @@ class Renderizador:
         self.scene = None
         self.framebuffers = {}
 
-    def setup(self):
+    def setup(self, supersampling=2):
         """Configura os buffers de superamostragem e profundidade."""
-        self.supersampling = 2
+        self.supersampling = max(1, int(supersampling))
         sample_width = self.width * self.supersampling
         sample_height = self.height * self.supersampling
 
@@ -210,7 +210,10 @@ class Renderizador:
                 scenegraph.Graph(self.scene.root)
 
         # Configura o sistema para a renderização.
-        self.setup()
+        # Para a animação, uma amostra por pixel evita quadruplicar o custo
+        # do rasterizador em todos os quadros. O modo pausado mantém a
+        # superamostragem para preservar a qualidade da imagem estática.
+        self.setup(supersampling=1 if not args.pause else 2)
 
         # Se no modo silencioso salvar imagem e não mostrar janela de visualização
         if args.quiet:
